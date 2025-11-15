@@ -98,34 +98,55 @@ function chooseServer() {
 }
 
 /* ============================================
-   4) Health Check (Phiên bản Async)
+   4) Health Check (Tự động thêm /healthz)
 ============================================ */
 function checkHealth() {
   // Biến mảng các promise
   const promises = servers.map(
     (s) =>
       new Promise((resolve) => {
-        const client = s.url.startsWith("https") ? https : http;
+        // --- BẮT ĐẦU SỬA ---
+        // Tự động tạo URL health check, ví dụ: "https://domain.com" -> "https://domain.com/healthz"
+        const healthCheckUrl = new URL(s.url);
+        healthCheckUrl.pathname =
+          healthCheckUrl.pathname.replace(/\/$/, "") + "/healthz";
+
+        const client = healthCheckUrl.protocol === "https:" ? https : http;
         const start = Date.now();
 
         client
-          .get(s.url, () => {
-            s.healthy = true;
-            s.responseTime = Date.now() - start;
-            s.lastCheck = new Date().toLocaleTimeString();
-            s.uptime++;
-            s.history.push(s.responseTime);
+          .get(healthCheckUrl, (res) => {
+            // <-- Dùng healthCheckUrl
+            // --- KẾT THÚC SỬA ---
+            const { statusCode } = res;
+
+            // Chỉ coi là "healthy" nếu status là 2xx
+            if (statusCode >= 200 && statusCode < 300) {
+              s.healthy = true;
+              s.responseTime = Date.now() - start;
+              s.uptime++;
+              s.history.push(s.responseTime);
+            } else {
+              // Bất kỳ status nào khác (như 503) đều là "down"
+              s.healthy = false;
+              s.responseTime = null;
+              s.downtime++;
+              s.history.push(0);
+            }
+
+            s.lastCheck = new Date().toLocaleTimeString(); // Cập nhật last check
+            res.resume(); // Hủy response để giải phóng bộ nhớ
             if (s.history.length > 20) s.history.shift();
-            resolve(); // Báo là đã xong
+            resolve();
           })
-          .on("error", () => {
+          .on("error", (err) => {
             s.healthy = false;
             s.responseTime = null;
             s.lastCheck = new Date().toLocaleTimeString();
             s.downtime++;
             s.history.push(0);
             if (s.history.length > 20) s.history.shift();
-            resolve(); // Vẫn resolve (để Promise.all không bị hỏng)
+            resolve();
           });
       })
   );
@@ -187,8 +208,6 @@ async function printStatus() {
   }
   // --- KẾT THÚC THAY ĐỔI ---
 }
-
-setInterval(printStatus, 5000);
 
 /* ============================================
   6.1) TẠO HTML CHO DASHBOARD (Phiên bản WebSocket)
@@ -378,8 +397,6 @@ const server = app.listen(PORT, () => {
 
 // Lưu lại các interval
 const printInterval = setInterval(printStatus, 5000);
-// Tắt watcher cũ (nó không có trong code mới của bạn)
-// const watcher = fs.watch(...)
 
 function gracefulShutdown() {
   console.log("\nSIGINT/SIGTERM received, shutting down gracefully...");
