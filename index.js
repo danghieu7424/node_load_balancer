@@ -76,7 +76,7 @@ function getStickyServer(clientId) {
 }
 
 /* ============================================
-   3) Round-robin chọn server sống
+   3) Round-robin chọn server sống
 ============================================ */
 function chooseServer() {
   const alive = servers.filter((s) => s.healthy);
@@ -142,12 +142,47 @@ function asciiGraph(values) {
 }
 
 /* ============================================
+   5.1) HTML Graph (biểu đồ latency cho web)
+============================================ */
+function htmlGraph(values) {
+  // Tìm giá trị max, chỉ lọc các giá trị là số
+  const numericValues = values.filter((v) => typeof v === "number");
+  const max = numericValues.length > 0 ? Math.max(...numericValues) : 1;
+
+  // Bắt đầu container
+  let graphHtml =
+    '<div style="display: flex; align-items: flex-end; justify-content: center; gap: 1px; height: 20px; min-width: 60px;">';
+
+  graphHtml += values
+    .map((v) => {
+      if (typeof v !== "number") {
+        // Slot trống ban đầu (" ")
+        return '<div style="width: .5rem; height: 1px; background-color: #e9ecef; border-radius: 1px;"></div>';
+      }
+
+      if (v === 0) {
+        // Check bị lỗi (DOWN)
+        return '<div style="width: .5rem; height: 2px; background-color: #dc3545; border-radius: 1px;" title="DOWN"></div>';
+      }
+
+      // Check thành công
+      const height = Math.max(1, (v / max) * 20); // Max 20px, min 1px
+      return `<div style="width: .5rem; height: ${height}px; background-color: #007bff; border-radius: 1px;" title="${v}ms"></div>`;
+    })
+    .join("");
+
+  graphHtml += "</div>";
+  return graphHtml;
+}
+
+/* ============================================
    6) In bảng trạng thái
 ============================================ */
 function printStatus() {
   console.clear();
   console.log("=== SERVER STATUS ===");
   console.log(`=== http://localhost:${PORT} ===\n`);
+  console.log(`=== http://localhost:${PORT}/load-balancer/dashboard ===\n`);
 
   const table = servers.map((s) => ({
     URL: s.url,
@@ -166,10 +201,87 @@ setInterval(checkHealth, 5000);
 setInterval(printStatus, 5000);
 
 /* ============================================
+   6.1) TẠO HTML CHO DASHBOARD
+============================================ */
+function generateDashboardHtml() {
+  let tableRows = "";
+  servers.forEach((s) => {
+    const uptimePercent = (
+      (s.uptime / (s.uptime + s.downtime + 1)) *
+      100
+    ).toFixed(1);
+    const healthStatus = s.healthy
+      ? '<span style="color: green;">🟢 ALIVE</span>'
+      : '<span style="color: red;">🔴 DOWN</span>';
+
+    // SỬ DỤNG HÀM MỚI
+    const graph = htmlGraph(s.history);
+
+    tableRows += `
+      <tr>
+        <td>${s.url}</td>
+        <td>${s.region || "-"}</td>
+        <td>${healthStatus}</td>
+        <td>${uptimePercent} %</td>
+        <td>${s.responseTime || "-"}</td>
+        <td>${graph}</td>
+        <td>${s.lastCheck || "-"}</td>
+      </tr>
+    `;
+  });
+
+  return `
+    <!DOCTYPE html>
+    <html lang="vi">
+    <head>
+      <meta charset="UTF-8">
+      <title>Load Balancer Status</title>
+      <meta http-equiv="refresh" content="5">
+      <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 2em; background-color: #f8f9fa; }
+        h1 { color: #343a40; }
+        table { border-collapse: collapse; width: 100%; background-color: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        th, td { border: 1px solid #dee2e6; padding: 12px; text-align: left; }
+        th { background-color: #f1f3f5; }
+      </style>
+    </head>
+    <body>
+      <h1>Load Balancer Dashboard</h1>
+      <table>
+        <thead>
+          <tr>
+            <th>URL</th>
+            <th>Region</th>
+            <th>Health</th>
+            <th>Uptime (%)</th>
+            <th>Resp (ms)</th>
+            <th>Latency Graph</th>
+            <th>Last Check</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${tableRows}
+        </tbody>
+      </table>
+    </body>
+    </html>
+  `;
+}
+
+/* ============================================
    7) Load Balancer chính
 ============================================ */
 http
   .createServer((req, res) => {
+    // --- THÊM ĐOẠN NÀY VÀO ---
+    // Kiểm tra xem có phải request vào dashboard không
+    if (req.url === "/load-balancer/dashboard") {
+      const html = generateDashboardHtml();
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      return res.end(html); // Trả về HTML và kết thúc
+    }
+    // --- KẾT THÚC ĐOẠN THÊM ---
+
     const clientId = getClientId(req);
 
     let target = getStickyServer(clientId);
