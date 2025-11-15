@@ -5,6 +5,7 @@ const httpProxy = require("http-proxy");
 const crypto = require("crypto");
 const express = require("express");
 const expressWs = require("express-ws");
+const cors = require("cors");
 
 const PORT = 8080;
 
@@ -16,6 +17,8 @@ const stickyMap = new Map();
 // KHỞI TẠO EXPRESS VÀ EXPRESS-WS
 const app = express();
 const wsInstance = expressWs(app);
+
+app.use(cors());
 
 /* ============================================
    1) Load servers.json + watcher auto reload
@@ -297,8 +300,11 @@ function generateDashboardHtml() {
 
         // Hàm kết nối WebSocket
         function connect() {
-          // Kết nối đến server WebSocket (chú ý 'ws://' thay vì 'http://')
-          const ws = new WebSocket(\`ws://\${window.location.host}\`);
+          // 1. Tự động xác định giao thức (ws hay wss)
+          const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+          
+          // 2. Kết nối bằng giao thức đúng
+          const ws = new WebSocket(\`\${protocol}//\${window.location.host}:8080\`);
 
           ws.onopen = () => {
             console.log("WebSocket connected!");
@@ -312,7 +318,7 @@ function generateDashboardHtml() {
 
           // Xử lý khi mất kết nối, tự động kết nối lại sau 3 giây
           ws.onclose = () => {
-            console.log("WebSocket disconnected. Reconnecting...");
+            // console.log("WebSocket disconnected. Reconnecting...");
             setTimeout(connect, 3000);
           };
 
