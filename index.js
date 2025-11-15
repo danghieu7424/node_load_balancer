@@ -3,6 +3,8 @@ const http = require("http");
 const https = require("https");
 const httpProxy = require("http-proxy");
 const crypto = require("crypto");
+const express = require("express");
+const expressWs = require("express-ws");
 
 const PORT = 8080;
 
@@ -11,6 +13,9 @@ let servers = loadServers();
 const proxy = httpProxy.createProxyServer({});
 let index = 0;
 const stickyMap = new Map();
+// KHỞI TẠO EXPRESS VÀ EXPRESS-WS
+const app = express();
+const wsInstance = expressWs(app);
 
 /* ============================================
    1) Load servers.json + watcher auto reload
@@ -50,7 +55,7 @@ function loadServers() {
   }));
 }
 
-fs.watch("./servers.json", () => {
+const watcher = fs.watch("./servers.json", () => {
   console.log("\n🔄 Reload servers.json...");
   servers = loadServers();
 });
@@ -93,34 +98,40 @@ function chooseServer() {
 }
 
 /* ============================================
-   4) Health Check + Uptime + lịch sử để vẽ ASCII
+   4) Health Check (Phiên bản Async)
 ============================================ */
 function checkHealth() {
-  servers.forEach((s) => {
-    const client = s.url.startsWith("https") ? https : http;
+  // Biến mảng các promise
+  const promises = servers.map(
+    (s) =>
+      new Promise((resolve) => {
+        const client = s.url.startsWith("https") ? https : http;
+        const start = Date.now();
 
-    const start = Date.now();
-
-    client
-      .get(s.url, () => {
-        s.healthy = true;
-        s.responseTime = Date.now() - start;
-        s.lastCheck = new Date().toLocaleTimeString();
-        s.uptime++;
-        s.history.push(s.responseTime);
-
-        if (s.history.length > 20) s.history.shift(); // Lưu max 20 giá trị
+        client
+          .get(s.url, () => {
+            s.healthy = true;
+            s.responseTime = Date.now() - start;
+            s.lastCheck = new Date().toLocaleTimeString();
+            s.uptime++;
+            s.history.push(s.responseTime);
+            if (s.history.length > 20) s.history.shift();
+            resolve(); // Báo là đã xong
+          })
+          .on("error", () => {
+            s.healthy = false;
+            s.responseTime = null;
+            s.lastCheck = new Date().toLocaleTimeString();
+            s.downtime++;
+            s.history.push(0);
+            if (s.history.length > 20) s.history.shift();
+            resolve(); // Vẫn resolve (để Promise.all không bị hỏng)
+          });
       })
-      .on("error", () => {
-        s.healthy = false;
-        s.responseTime = null;
-        s.lastCheck = new Date().toLocaleTimeString();
-        s.downtime++;
-        s.history.push(0);
+  );
 
-        if (s.history.length > 20) s.history.shift();
-      });
-  });
+  // Trả về một promise duy nhất chờ tất cả check hoàn tất
+  return Promise.all(promises);
 }
 
 /* ============================================
@@ -142,46 +153,13 @@ function asciiGraph(values) {
 }
 
 /* ============================================
-   5.1) HTML Graph (biểu đồ latency cho web)
-============================================ */
-function htmlGraph(values) {
-  // Tìm giá trị max, chỉ lọc các giá trị là số
-  const numericValues = values.filter((v) => typeof v === "number");
-  const max = numericValues.length > 0 ? Math.max(...numericValues) : 1;
-
-  // Bắt đầu container
-  let graphHtml =
-    '<div style="display: flex; align-items: flex-end; justify-content: center; gap: 1px; height: 20px; min-width: 60px;">';
-
-  graphHtml += values
-    .map((v) => {
-      if (typeof v !== "number") {
-        // Slot trống ban đầu (" ")
-        return '<div style="width: .5rem; height: 1px; background-color: #e9ecef; border-radius: 1px;"></div>';
-      }
-
-      if (v === 0) {
-        // Check bị lỗi (DOWN)
-        return '<div style="width: .5rem; height: 2px; background-color: #dc3545; border-radius: 1px;" title="DOWN"></div>';
-      }
-
-      // Check thành công
-      const height = Math.max(1, (v / max) * 20); // Max 20px, min 1px
-      return `<div style="width: .5rem; height: ${height}px; background-color: #007bff; border-radius: 1px;" title="${v}ms"></div>`;
-    })
-    .join("");
-
-  graphHtml += "</div>";
-  return graphHtml;
-}
-
-/* ============================================
    6) In bảng trạng thái
 ============================================ */
-function printStatus() {
+async function printStatus() {
+  await checkHealth();
   console.clear();
   console.log("=== SERVER STATUS ===");
-  console.log(`=== http://localhost:${PORT} ===\n`);
+  console.log(`=== http://localhost:${PORT} ===`);
   console.log(`=== http://localhost:${PORT}/load-balancer/dashboard ===\n`);
 
   const table = servers.map((s) => ({
@@ -195,49 +173,34 @@ function printStatus() {
   }));
 
   console.table(table);
+
+  // --- THAY ĐỔI PHẦN NÀY ---
+  // Lấy WebSocket Server từ 'wsInstance'
+  const wss = wsInstance.getWss();
+  if (wss) {
+    const data = JSON.stringify(servers);
+    wss.clients.forEach((client) => {
+      if (client.readyState === 1) {
+        client.send(data);
+      }
+    });
+  }
+  // --- KẾT THÚC THAY ĐỔI ---
 }
 
-setInterval(checkHealth, 5000);
 setInterval(printStatus, 5000);
 
 /* ============================================
-   6.1) TẠO HTML CHO DASHBOARD
+  6.1) TẠO HTML CHO DASHBOARD (Phiên bản WebSocket)
 ============================================ */
 function generateDashboardHtml() {
-  let tableRows = "";
-  servers.forEach((s) => {
-    const uptimePercent = (
-      (s.uptime / (s.uptime + s.downtime + 1)) *
-      100
-    ).toFixed(1);
-    const healthStatus = s.healthy
-      ? '<span style="color: green;">🟢 ALIVE</span>'
-      : '<span style="color: red;">🔴 DOWN</span>';
-
-    // SỬ DỤNG HÀM MỚI
-    const graph = htmlGraph(s.history);
-
-    tableRows += `
-      <tr>
-        <td>${s.url}</td>
-        <td>${s.region || "-"}</td>
-        <td>${healthStatus}</td>
-        <td>${uptimePercent} %</td>
-        <td>${s.responseTime || "-"}</td>
-        <td>${graph}</td>
-        <td>${s.lastCheck || "-"}</td>
-      </tr>
-    `;
-  });
-
   return `
     <!DOCTYPE html>
     <html lang="vi">
     <head>
       <meta charset="UTF-8">
       <title>Load Balancer Status</title>
-      <meta http-equiv="refresh" content="5">
-      <style>
+            <style>
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 2em; background-color: #f8f9fa; }
         h1 { color: #343a40; }
         table { border-collapse: collapse; width: 100%; background-color: #fff; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
@@ -259,64 +222,197 @@ function generateDashboardHtml() {
             <th>Last Check</th>
           </tr>
         </thead>
-        <tbody>
-          ${tableRows}
-        </tbody>
+        <tbody id="dashboard-tbody">
+                  </tbody>
       </table>
+
+            <script>
+        const tbody = document.getElementById("dashboard-tbody");
+
+        // Hàm tạo graph (sao chép logic từ hàm htmlGraph)
+        function createGraph(values) {
+          const numericValues = values.filter((v) => typeof v === "number");
+          const max = numericValues.length > 0 ? Math.max(...numericValues) : 1;
+          
+          let graphHtml = '<div style="display: flex; align-items: flex-end; justify-content: center; gap: 1px; height: 20px; min-width: 60px;">';
+          graphHtml += values.map((v) => {
+            if (typeof v !== "number") {
+              return '<div style="width: .5rem; height: 1px; background-color: #e9ecef; border-radius: 1px;"></div>';
+            }
+            if (v === 0) {
+              return '<div style="width: .5rem; height: 2px; background-color: #dc3545; border-radius: 1px;" title="DOWN"></div>';
+            }
+            const height = Math.max(1, (v / max) * 20);
+            return \`<div style="width: .5rem; height: \${height}px; background-color: #007bff; border-radius: 1px;" title="\${v}ms"></div>\`;
+          }).join("");
+          graphHtml += "</div>";
+          return graphHtml;
+        }
+
+        // Hàm cập nhật nội dung bảng
+        function updateTable(servers) {
+          let tableRows = "";
+          servers.forEach((s) => {
+            const uptimePercent = (
+              (s.uptime / (s.uptime + s.downtime + 1)) * 100
+            ).toFixed(1);
+            const healthStatus = s.healthy
+              ? '<span style="color: green;">🟢 ALIVE</span>'
+              : '<span style="color: red;">🔴 DOWN</span>';
+            const graph = createGraph(s.history);
+
+            tableRows += \`
+              <tr>
+                <td>\${s.url}</td>
+                <td>\${s.region || "-"}</td>
+                <td>\${healthStatus}</td>
+                <td>\${uptimePercent} %</td>
+                <td>\${s.responseTime || "-"}</td>
+                <td>\${graph}</td>
+                <td>\${s.lastCheck || "-"}</td>
+              </tr>
+            \`;
+          });
+          tbody.innerHTML = tableRows;
+        }
+
+        // Hàm kết nối WebSocket
+        function connect() {
+          // Kết nối đến server WebSocket (chú ý 'ws://' thay vì 'http://')
+          const ws = new WebSocket(\`ws://\${window.location.host}\`);
+
+          ws.onopen = () => {
+            console.log("WebSocket connected!");
+          };
+
+          // Lắng nghe tin nhắn (dữ liệu) từ server
+          ws.onmessage = (event) => {
+            const servers = JSON.parse(event.data);
+            updateTable(servers); // Cập nhật bảng
+          };
+
+          // Xử lý khi mất kết nối, tự động kết nối lại sau 3 giây
+          ws.onclose = () => {
+            console.log("WebSocket disconnected. Reconnecting...");
+            setTimeout(connect, 3000);
+          };
+
+          ws.onerror = (err) => {
+            console.error("WebSocket error:", err);
+          };
+        }
+
+        // Bắt đầu kết nối khi trang được tải
+        connect();
+      </script>
     </body>
     </html>
   `;
 }
 
 /* ============================================
-   7) Load Balancer chính
+  7) Load Balancer chính (Phiên bản Express)
 ============================================ */
-http
-  .createServer((req, res) => {
-    // --- THÊM ĐOẠN NÀY VÀO ---
-    // Kiểm tra xem có phải request vào dashboard không
-    if (req.url === "/load-balancer/dashboard") {
-      const html = generateDashboardHtml();
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      return res.end(html); // Trả về HTML và kết thúc
-    }
-    // --- KẾT THÚC ĐOẠN THÊM ---
 
-    const clientId = getClientId(req);
+// 1. Route cho trang dashboard HTML
+app.get("/load-balancer/dashboard", (req, res) => {
+  const html = generateDashboardHtml();
+  res.send(html); // Express tự set Content-Type
+});
 
-    let target = getStickyServer(clientId);
-    if (!target) {
-      target = chooseServer();
-      if (target) stickyMap.set(clientId, target);
-    }
+// 2. Route cho kết nối WebSocket
+app.ws("/", (ws, req) => {
+  console.log("Một client đã kết nối vào dashboard!");
 
-    if (!target) {
-      res.writeHead(503);
-      return res.end("No backend servers alive");
-    }
+  // Gửi ngay dữ liệu hiện tại cho client vừa kết nối
+  ws.send(JSON.stringify(servers));
 
-    function send(retry = false) {
-      // TẠO OPTIONS Ở ĐÂY
-      const options = {
-        target,
-        changeOrigin: true, // <-- THÊM DÒNG NÀY
-      };
-
-      proxy.web(req, res, options, (err) => {
-        // Dùng `options` mới
-        if (!retry) {
-          target = chooseServer();
-          // Cập nhật lại target trong options cho lần retry
-          options.target = target;
-          return send(true);
-        }
-        res.writeHead(500);
-        res.end("Load balancer error");
-      });
-    }
-
-    send();
-  })
-  .listen(PORT, () => {
-    console.log("Load balancer running...");
+  ws.on("close", () => {
+    console.log("Client đã ngắt kết nối.");
   });
+});
+
+// 3. Route "catch-all" cho tất cả các request CÒN LẠI (proxy)
+app.use((req, res) => {
+  // --- Mọi logic proxy cũ của bạn giữ nguyên ---
+  const clientId = getClientId(req);
+
+  let target = getStickyServer(clientId);
+  if (!target) {
+    target = chooseServer();
+    if (target) stickyMap.set(clientId, target);
+  }
+
+  if (!target) {
+    res.status(503).send("No backend servers alive");
+    return;
+  }
+
+  function send(retry = false) {
+    const options = {
+      target,
+      changeOrigin: true,
+    };
+
+    proxy.web(req, res, options, (err) => {
+      if (!retry) {
+        target = chooseServer();
+        options.target = target;
+        return send(true);
+      }
+      res.status(500).send("Load balancer error");
+    });
+  }
+
+  send();
+});
+
+// Thay thế dòng app.listen(PORT, ...) cũ bằng 2 dòng này:
+const server = app.listen(PORT, () => {
+  console.log("Load balancer (Express) đang chạy...");
+});
+
+/* ============================================
+  8) Graceful Shutdown
+============================================ */
+
+// Lưu lại các interval
+const printInterval = setInterval(printStatus, 5000);
+// Tắt watcher cũ (nó không có trong code mới của bạn)
+// const watcher = fs.watch(...)
+
+function gracefulShutdown() {
+  console.log("\nSIGINT/SIGTERM received, shutting down gracefully...");
+
+  // 1. Dừng các timer và watcher
+  clearInterval(printInterval);
+  watcher.close();
+
+  // 2. Lấy WSS từ instance và đóng
+  const wss = wsInstance.getWss();
+  wss.clients.forEach((client) => {
+    client.close();
+  });
+  wss.close(() => {
+    console.log("WebSocket server closed.");
+  });
+
+  // 3. Đóng HTTP server
+  server.close(() => {
+    console.log("HTTP server closed.");
+    process.exit(0); // Thoát hoàn toàn
+  });
+
+  // Đặt timeout để ép thoát nếu bị kẹt
+  setTimeout(() => {
+    console.error(
+      "Could not close connections in time, forcefully shutting down"
+    );
+    process.exit(1);
+  }, 10000); // 10 giây
+}
+
+// Lắng nghe tín hiệu tắt (Ctrl+C)
+process.on("SIGINT", gracefulShutdown);
+// Lắng nghe tín hiệu restart (từ nodemon/pm2)
+process.on("SIGTERM", gracefulShutdown);
