@@ -4,7 +4,6 @@ const https = require("https");
 const httpProxy = require("http-proxy");
 const crypto = require("crypto");
 const express = require("express");
-const expressWs = require("express-ws");
 const cors = require("cors");
 
 const PORT = 8080;
@@ -14,11 +13,11 @@ let servers = loadServers();
 const proxy = httpProxy.createProxyServer({});
 let index = 0;
 const stickyMap = new Map();
-// KHỞI TẠO EXPRESS VÀ EXPRESS-WS
-const app = express();
-const wsInstance = expressWs(app);
 
+const app = express();
 app.use(cors());
+
+let sseClients = [];
 
 /* ============================================
    1) Load servers.json + watcher auto reload
@@ -199,16 +198,14 @@ async function printStatus() {
   console.table(table);
 
   // --- THAY ĐỔI PHẦN NÀY ---
-  // Lấy WebSocket Server từ 'wsInstance'
-  const wss = wsInstance.getWss();
-  if (wss) {
-    const data = JSON.stringify(servers);
-    wss.clients.forEach((client) => {
-      if (client.readyState === 1) {
-        client.send(data);
-      }
-    });
-  }
+  // Lấy WebSocket Server từ 'wsInstance' (XÓA BỎ)
+
+  // Gửi dữ liệu cho các client SSE
+  const data = JSON.stringify(servers);
+  sseClients.forEach((client) => {
+    // SSE yêu cầu định dạng "data: {json_string}\n\n"
+    client.write(`data: ${data}\n\n`);
+  });
   // --- KẾT THÚC THAY ĐỔI ---
 }
 
@@ -248,7 +245,7 @@ function generateDashboardHtml() {
                   </tbody>
       </table>
 
-            <script>
+      <script>
         const tbody = document.getElementById("dashboard-tbody");
 
         // Hàm tạo graph (sao chép logic từ hàm htmlGraph)
@@ -298,32 +295,26 @@ function generateDashboardHtml() {
           tbody.innerHTML = tableRows;
         }
 
-        // Hàm kết nối WebSocket
+        // --- THAY THẾ TOÀN BỘ HÀM CONNECT ---
+        // Hàm kết nối (Dùng EventSource thay vì WebSocket)
         function connect() {
-          // 1. Tự động xác định giao thức (ws hay wss)
-          const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-          
-          // 2. Kết nối bằng giao thức đúng
-          const ws = new WebSocket(\`\${protocol}//\${window.location.host}:8080\`);
+          // 1. Kết nối đến route /load-balancer/events
+          const evtSource = new EventSource("/load-balancer/events");
 
-          ws.onopen = () => {
-            console.log("WebSocket connected!");
+          evtSource.onopen = () => {
+            console.log("SSE Connection established!");
           };
 
-          // Lắng nghe tin nhắn (dữ liệu) từ server
-          ws.onmessage = (event) => {
+          // 2. Lắng nghe tin nhắn (mặc định là 'onmessage')
+          evtSource.onmessage = (event) => {
             const servers = JSON.parse(event.data);
-            updateTable(servers); // Cập nhật bảng
+            updateTable(servers);
           };
 
-          // Xử lý khi mất kết nối, tự động kết nối lại sau 3 giây
-          ws.onclose = () => {
-            // console.log("WebSocket disconnected. Reconnecting...");
-            setTimeout(connect, 3000);
-          };
-
-          ws.onerror = (err) => {
-            console.error("WebSocket error:", err);
+          // 3. Xử lý lỗi (SSE tự động kết nối lại)
+          evtSource.onerror = (err) => {
+            console.error("EventSource error:", err);
+            // EventSource sẽ tự động thử kết nối lại sau vài giây
           };
         }
 
@@ -345,15 +336,25 @@ app.get("/load-balancer/dashboard", (req, res) => {
   res.send(html); // Express tự set Content-Type
 });
 
-// 2. Route cho kết nối WebSocket
-app.ws("/", (ws, req) => {
-  console.log("Một client đã kết nối vào dashboard!");
+// 2. Route cho Server-Sent Events (SSE)
+app.get("/load-balancer/events", (req, res) => {
+  // Thiết lập headers cho kết nối SSE (rất quan trọng)
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders(); // Gửi headers ngay lập tức
 
-  // Gửi ngay dữ liệu hiện tại cho client vừa kết nối
-  ws.send(JSON.stringify(servers));
+  // Thêm client (cái 'res') này vào danh sách
+  sseClients.push(res);
+  console.log("Một client đã kết nối SSE.");
 
-  ws.on("close", () => {
-    console.log("Client đã ngắt kết nối.");
+  // Gửi ngay dữ liệu hiện tại (để client không phải chờ 5s)
+  res.write(`data: ${JSON.stringify(servers)}\n\n`);
+
+  // Xử lý khi client ngắt kết nối
+  req.on("close", () => {
+    sseClients = sseClients.filter((client) => client !== res);
+    console.log("Client SSE đã ngắt kết nối.");
   });
 });
 
@@ -411,13 +412,10 @@ function gracefulShutdown() {
   clearInterval(printInterval);
   watcher.close();
 
-  // 2. Lấy WSS từ instance và đóng
-  const wss = wsInstance.getWss();
-  wss.clients.forEach((client) => {
-    client.close();
-  });
-  wss.close(() => {
-    console.log("WebSocket server closed.");
+  // 2. Đóng tất cả kết nối SSE
+  console.log(`Closing ${sseClients.length} SSE connections...`);
+  sseClients.forEach((client) => {
+    client.end(); // Kết thúc response HTTP
   });
 
   // 3. Đóng HTTP server
