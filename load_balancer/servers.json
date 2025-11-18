@@ -1,0 +1,5 @@
+[
+  { "url": "https://p.dh74.io.vn", "region": "vi" },
+  { "url": "https://api.dh74.io.vn", "region": "vi" },
+  { "url": "http://localhost:8000", "region": "vi" }
+]
